@@ -19,10 +19,19 @@
  *     relation under the dossier) via a single batched
  *     UpdateObjectRelations call, so the native Attachments panel will
  *     reflect the new order the next time it loads/refreshes.
- *   - Sort by Name and Type are implemented. Sort by "date added to
- *     dossier" is deferred (no reliable timestamp field was found on
- *     the Relation entity in the v10.64 Workflow SDK docs) and is
- *     shown disabled in the dropdown for now.
+ *   - Sort by Name, Type, Date created, and Date modified are
+ *     implemented. "Date added to dossier" specifically is NOT
+ *     possible: the Relation entity (the link between a dossier and
+ *     its attachments) has no timestamp field at all in the v10.64
+ *     Workflow SDK docs — its only properties are Parent, Child,
+ *     Type, Placements, ParentVersion/ChildVersion, Rating, Targets,
+ *     ParentInfo/ChildInfo, ObjectLabels, and Order. "Created" and
+ *     "Modified" instead come from each attachment's OWN
+ *     WorkflowMetaData (when the image/video/audio file itself was
+ *     created/last modified in Studio) — not when it was added to
+ *     THIS dossier. For freshly ingested assets the two are usually
+ *     the same day, but for an older asset re-added to a new
+ *     dossier they will differ.
  *
  * Digital Editor SDK APIs used (per the team's existing
  * sync-print-to-digital-sidepanel.js example):
@@ -42,6 +51,10 @@
  *          Image/Video/Audio types
  *   - UpdateObjectRelations — writes new Order values back onto the
  *     dossier's "Contained" relations after a manual sort
+ *   - GetObjects (on the attachment IDs themselves, no RequestInfo
+ *     restriction so the server's default MetaData is returned) —
+ *     used only to read MetaData.WorkflowMetaData.Created/Modified
+ *     for the "Date created" / "Date modified" sort options.
  *
  * ⚠ ASSUMPTIONS THAT NEED LIVE VERIFICATION IN STUDIO ⚠
  * The v10.64.2 SDK docs provided describe the Workflow data model
@@ -71,6 +84,12 @@
  *      the docs (added in v10.63, "Order of the child object in
  *      relation to the parent context") but isn't explicitly
  *      documented as driving that specific panel's UI.
+ *   6. That WorkflowMetaData.Created/Modified are returned in the
+ *      documented "yyyy-mm-dd@hh:mm:ss" format for every attachment
+ *      type (Image/Video/Audio) — this code sorts the raw strings
+ *      lexically, which is safe as long as that fixed-width format
+ *      holds, with no timezone normalization needed/possible since
+ *      the docs don't specify a timezone for this value.
  */
 (function () {
     'use strict';
@@ -232,6 +251,30 @@
         return items;
     }
 
+    // ── Step 2b: fetch each attachment's own Created/Modified dates ──────
+    // (best-effort — not required for the panel to function; only needed
+    // to enable the "Date created" / "Date modified" sort options.)
+    async function fetchAttachmentDates(items) {
+        if (!items.length) return;
+        const result = await wflCall('GetObjects', {
+            IDs: items.map((item) => item.childId),
+            Lock: false,
+            Rendition: 'none',
+        });
+        const objects = getObjectsFromResult(result);
+        const byId = new Map();
+        objects.forEach((obj) => {
+            const id = obj?.MetaData?.BasicMetaData?.ID;
+            if (id) byId.set(String(id), obj.MetaData?.WorkflowMetaData || {});
+        });
+        items.forEach((item) => {
+            const wf = byId.get(item.childId);
+            item.created = (wf && wf.Created) || null;
+            item.modified = (wf && wf.Modified) || null;
+        });
+        log('Loaded created/modified dates for', byId.size, 'of', items.length, 'attachment(s)');
+    }
+
     // ── Step 3: persist new order back to the server ─────────────────────
     async function persistOrder(items) {
         const relations = items.map((item, idx) => ({
@@ -254,9 +297,28 @@
                 const t = a.type.localeCompare(b.type);
                 return t !== 0 ? t : a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true });
             });
+        } else if (key === 'created' || key === 'modified') {
+            // Dates come back as fixed-width "yyyy-mm-dd@hh:mm:ss" strings,
+            // which sort correctly with plain lexical comparison. Items
+            // with no date (fetch failed/missing) sort to the end.
+            copy.sort((a, b) => {
+                const av = a[key] || '';
+                const bv = b[key] || '';
+                if (!av && !bv) return 0;
+                if (!av) return 1;
+                if (!bv) return -1;
+                return av < bv ? -1 : av > bv ? 1 : 0;
+            });
         }
         return copy;
     }
+
+    const SORT_LABELS = {
+        name: 'name',
+        type: 'type',
+        created: 'date created',
+        modified: 'date modified',
+    };
 
     // ── Panel markup ───────────────────────────────────────────────────
     function escapeHtml(s) {
@@ -394,7 +456,8 @@
     <select id="sort-key" disabled>
         <option value="name">Name (A–Z)</option>
         <option value="type">Type</option>
-        <option value="dateAdded" disabled>Date added to dossier (coming soon)</option>
+        <option value="created" id="opt-created" disabled>Date created (oldest first)</option>
+        <option value="modified" id="opt-modified" disabled>Date modified (oldest first)</option>
     </select>
 
     <button id="btn-sort" class="btn" disabled>Sort</button>
@@ -463,6 +526,16 @@
                 const btnSort = panelDoc.getElementById('btn-sort');
                 sortKeySelect.disabled = attachmentItems.length < 2;
                 btnSort.disabled = attachmentItems.length < 2;
+
+                // Best-effort: don't let a date-fetch failure break the
+                // panel — name/type sorting already works at this point.
+                try {
+                    await fetchAttachmentDates(attachmentItems);
+                    panelDoc.getElementById('opt-created').disabled = false;
+                    panelDoc.getElementById('opt-modified').disabled = false;
+                } catch (dateErr) {
+                    logWarn('fetchAttachmentDates failed (Date created/modified will stay disabled):', dateErr);
+                }
             } catch (err) {
                 logError('loadAttachments failed:', err);
                 setStatus('error', 'Failed to load attachments: ' + err.message);
@@ -479,14 +552,15 @@
             attachmentItems = sortItems(attachmentItems, key);
             lastSortKey = key;
             renderList();
-            setStatus('success', `Sorted by ${key === 'name' ? 'name' : 'type'}.`);
+            const label = SORT_LABELS[key] || key;
+            setStatus('success', `Sorted by ${label}.`);
 
             // Persist in the background so the native Attachments panel
             // reflects this order once it next loads/refreshes.
             btnSort.disabled = true;
             try {
                 await persistOrder(attachmentItems);
-                setStatus('success', `Sorted by ${key === 'name' ? 'name' : 'type'} — saved.`);
+                setStatus('success', `Sorted by ${label} — saved.`);
             } catch (err) {
                 logError('persistOrder failed:', err);
                 setStatus('error', 'Sorted here, but saving the new order to the server failed: ' + err.message);
