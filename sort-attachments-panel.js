@@ -479,6 +479,7 @@
         let panelDoc = null;
         let attachmentItems = [];
         let lastSortKey = null;
+        let currentDossierId = null;
 
         function setStatus(type, message) {
             if (!panelDoc) return;
@@ -517,6 +518,7 @@
                 if (!articleId) throw new Error('Could not read the open article’s ID.');
 
                 const dossierId = await findDossierId(articleId);
+                currentDossierId = dossierId;
                 attachmentItems = await fetchAttachments(dossierId);
 
                 renderList();
@@ -561,6 +563,29 @@
             try {
                 await persistOrder(attachmentItems);
                 setStatus('success', `Sorted by ${label} — saved.`);
+
+                // ── Diagnostic only: confirm what actually landed on the
+                // server. This does not change panel behavior — it exists
+                // to answer one question definitively from the console:
+                // did the Order values we just wrote actually get stored?
+                // If yes here but the native Attachments panel still shows
+                // the old order after a reload, that proves the native
+                // panel doesn't use Relation.Order for its display
+                // sequence (assumption #5 in the header comment was
+                // wrong) — a real product limitation, not a bug in this
+                // plugin's save logic. If the values below do NOT match
+                // the intended 1..N order, the write itself isn't taking
+                // effect and the fix belongs in persistOrder()/
+                // UpdateObjectRelations instead.
+                try {
+                    const verifyItems = await fetchAttachments(currentDossierId);
+                    log(
+                        'Post-save verification — Order values now on server:',
+                        verifyItems.map((it) => `${it.name}: Order=${it.order}`)
+                    );
+                } catch (verifyErr) {
+                    logWarn('Post-save verification fetch failed:', verifyErr);
+                }
             } catch (err) {
                 logError('persistOrder failed:', err);
                 setStatus('error', 'Sorted here, but saving the new order to the server failed: ' + err.message);
