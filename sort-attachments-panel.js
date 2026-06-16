@@ -162,6 +162,8 @@
     async function findDossierId(articleId) {
         const result = await wflCall('GetObjects', {
             IDs: [articleId],
+            Lock: false,
+            Rendition: 'none',
             RequestInfo: ['Relations'],
         });
         const objects = getObjectsFromResult(result);
@@ -195,6 +197,8 @@
     async function fetchAttachments(dossierId) {
         const result = await wflCall('GetObjects', {
             IDs: [dossierId],
+            Lock: false,
+            Rendition: 'none',
             RequestInfo: ['Relations'],
         });
         const objects = getObjectsFromResult(result);
